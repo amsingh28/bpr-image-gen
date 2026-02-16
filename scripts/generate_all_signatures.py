@@ -11,26 +11,29 @@ Usage:
 """
 
 import argparse
+import io
 import os
 import sys
 import time
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageFilter
 
 # ── Paths ─────────────────────────────────────────────────────────────
 
 ROOT = Path(__file__).resolve().parent.parent
-STOCK_PHOTO = ROOT.parent / "bpr-web" / "public" / "door-images" / "door-traditional.png"
+DOOR_IMAGES = ROOT.parent / "bpr-web" / "public" / "door-images"
 OUTPUT_BASE = ROOT / "output"
 
-# Door slab bounds for door-traditional.png (from fine-grained pixel analysis)
-# Left: brightness jumps 75→199 at x=365; Right: drops 185→92 at x=712
-# Top: door surface starts at y=140; Bottom: drops 182→88 at y=817
-DOOR_X1, DOOR_Y1 = 365, 140
-DOOR_X2, DOOR_Y2 = 712, 817
-DOOR_W = DOOR_X2 - DOOR_X1  # 347
-DOOR_H = DOOR_Y2 - DOOR_Y1  # 677
+# Default stock photo and door slab bounds (door-traditional.png)
+DEFAULT_STOCK_PHOTO = DOOR_IMAGES / "door-traditional.png"
+DEFAULT_DOOR_BOUNDS = (365, 140, 712, 817)
+
+# Per-stock-photo door bounds
+STOCK_PHOTO_BOUNDS = {
+    "door-traditional.png": (365, 140, 712, 817),
+    "door-craftsman.png": (398, 100, 688, 820),
+}
 
 # ── Template configs ──────────────────────────────────────────────────
 # Extracted from bpr-backend/app/services/door_templates.py
@@ -162,6 +165,25 @@ SIGNATURE_TEMPLATES = {
         ],
         "handle_description": "a tall modern long-pull door handle — a sleek oil-rubbed bronze vertical bar that runs almost half the door height, mounted on small standoff brackets. Make it look like real aged bronze with warm dark patina and subtle highlights",
     },
+    "craftsman": {
+        "name": "Craftsman",
+        "wood_type": "white-oak",
+        "stain_color": "#6B5B4A",
+        "stock_photo": "door-craftsman.png",
+        "handle": {
+            "style": "square-pull",
+            "finish": "matte-black",
+            "side": "left",
+            "heightFromBottom": 40,
+        },
+        "elements": [
+            {"type": "recessed-panel", "position": {"x": 8, "y": 5}, "size": {"width": 20, "height": 22}, "depth": 0.625},
+            {"type": "recessed-panel", "position": {"x": 8, "y": 29}, "size": {"width": 20, "height": 22}, "depth": 0.625},
+            {"type": "recessed-panel", "position": {"x": 8, "y": 53}, "size": {"width": 20, "height": 22}, "depth": 0.625},
+        ],
+        "handle_description": "a square-pull door handle — a short matte black vertical bar about 12 inches long, mounted at waist height with standoff brackets. Make it look like real brushed matte black metal",
+        "prompt_context": "decorative leaded glass sidelights and a transom window",
+    },
 }
 
 
@@ -171,6 +193,7 @@ def build_prompt(template: dict) -> str:
     """Build Gemini prompt customized to the template's features."""
     name = template["name"]
     handle_desc = template["handle_description"]
+    context = template.get("prompt_context", "white sidelights")
 
     has_glass = any(e["type"] == "glass-panel" for e in template["elements"])
     has_panels = any(e["type"] == "recessed-panel" for e in template["elements"])
@@ -187,14 +210,39 @@ def build_prompt(template: dict) -> str:
 
     features_text = ", ".join(features)
 
+    # Build a description of what the door design looks like
+    element_counts = {}
+    for e in template["elements"]:
+        element_counts[e["type"]] = element_counts.get(e["type"], 0) + 1
+    design_parts = []
+    if "recessed-panel" in element_counts:
+        design_parts.append(f"{element_counts['recessed-panel']} recessed panel(s)")
+    if "groove" in element_counts:
+        design_parts.append(f"{element_counts['groove']} groove(s)")
+    if "glass-panel" in element_counts:
+        design_parts.append(f"{element_counts['glass-panel']} glass panel(s)")
+    design_desc = " and ".join(design_parts) if design_parts else "a flat slab"
+
+    # Build explicit list of what NOT to add
+    forbidden = []
+    if not has_glass:
+        forbidden.append("glass windows, lites, or transoms")
+    if not has_grooves:
+        forbidden.append("grooves or lines")
+    forbidden.append("decorative molding, dentils, or carvings")
+    forbidden_text = ", ".join(forbidden)
+
     return (
-        f"This is a photo of a house entrance with white sidelights. The door panel "
+        f"This is a photo of a house entrance with {context}. The door panel "
         f"in the center has been digitally composited and looks flat/fake. This is the "
-        f"{name} door design. Make the door panel look photorealistic — add {features_text}. "
-        f"The hardware on the left side of the door is {handle_desc}, matching the style "
-        f"of high-end modern entry door hardware. "
-        f"Keep the EXACT same composition, framing, and every pixel outside "
-        f"the door panel completely unchanged. Output the full 1024x1024 image."
+        f"{name} door design. The door has EXACTLY {design_desc} — do NOT change the "
+        f"number, size, or layout of these elements. "
+        f"Make ONLY the door panel look photorealistic — add {features_text}. "
+        f"The hardware on the left side of the door is {handle_desc}. "
+        f"CRITICAL: Do NOT add {forbidden_text} to the door. Do NOT redesign the door. "
+        f"The composited door layout is the EXACT design — only enhance material realism. "
+        f"Keep every pixel outside the door panel completely unchanged. "
+        f"Output the full 1024x1024 image."
     )
 
 
@@ -204,6 +252,15 @@ def generate_template(slug: str, template: dict, num_variants: int = 3):
     """Run full pipeline for one template."""
     from render_slab_generic import render_door_slab
 
+    # Resolve per-template stock photo and door bounds
+    stock_photo_name = template.get("stock_photo", "door-traditional.png")
+    stock_photo_path = DOOR_IMAGES / stock_photo_name
+    door_x1, door_y1, door_x2, door_y2 = STOCK_PHOTO_BOUNDS.get(
+        stock_photo_name, DEFAULT_DOOR_BOUNDS
+    )
+    door_w = door_x2 - door_x1
+    door_h = door_y2 - door_y1
+
     out_dir = OUTPUT_BASE / slug
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -211,13 +268,15 @@ def generate_template(slug: str, template: dict, num_variants: int = 3):
     print(f"  {template['name']} ({slug})")
     print(f"  Wood: {template['wood_type']}, Stain: {template['stain_color']}")
     print(f"  Elements: {len(template['elements'])}")
+    print(f"  Stock photo: {stock_photo_name}")
+    print(f"  Door bounds: ({door_x1},{door_y1}) -> ({door_x2},{door_y2}) = {door_w}x{door_h}")
     print(f"{'='*60}")
 
     # Step 1: Render slab
     slab_path = out_dir / "slab.png"
     render_door_slab(
         slab_path,
-        width_px=DOOR_W,
+        width_px=door_w,
         wood_type=template["wood_type"],
         stain_color=template["stain_color"],
         elements=template["elements"],
@@ -225,10 +284,10 @@ def generate_template(slug: str, template: dict, num_variants: int = 3):
     )
 
     # Step 2: Composite
-    stock = Image.open(STOCK_PHOTO).convert("RGBA")
+    stock = Image.open(stock_photo_path).convert("RGBA")
     slab = Image.open(slab_path).convert("RGBA")
-    slab_resized = slab.resize((DOOR_W, DOOR_H), Image.LANCZOS)
-    stock.paste(slab_resized, (DOOR_X1, DOOR_Y1))
+    slab_resized = slab.resize((door_w, door_h), Image.LANCZOS)
+    stock.paste(slab_resized, (door_x1, door_y1))
 
     composite_path = out_dir / "composite.png"
     stock.convert("RGB").save(composite_path)
@@ -246,6 +305,9 @@ def generate_template(slug: str, template: dict, num_variants: int = 3):
     client = genai.Client(api_key=api_key)
     composite_bytes = composite_path.read_bytes()
     prompt = build_prompt(template)
+
+    # Load original stock photo for post-processing (clamp door to bounds)
+    original_stock = Image.open(stock_photo_path).convert("RGB")
 
     for i in range(1, num_variants + 1):
         print(f"  Gemini variant {i}/{num_variants}...")
@@ -269,8 +331,35 @@ def generate_template(slug: str, template: dict, num_variants: int = 3):
             for part in response.candidates[0].content.parts:
                 if part.inline_data and part.inline_data.mime_type.startswith("image/"):
                     out_path = out_dir / f"variant-{i}.png"
-                    out_path.write_bytes(part.inline_data.data)
-                    print(f"    Saved: {out_path}")
+
+                    # Post-process: extract the door region from Gemini output
+                    # and blend it onto the original stock photo. We shrink
+                    # the crop inward by MARGIN pixels so the original door
+                    # frame/trim is preserved, and feather the edges for a
+                    # smooth transition.
+                    MARGIN = 15
+                    FEATHER = 8
+                    gemini_img = Image.open(io.BytesIO(part.inline_data.data)).convert("RGB")
+                    gemini_img = gemini_img.resize(original_stock.size, Image.LANCZOS)
+
+                    # Build a soft alpha mask: white in the inner door area,
+                    # black outside, with feathered edges for blending.
+                    inner_x1 = door_x1 + MARGIN
+                    inner_y1 = door_y1 + MARGIN
+                    inner_x2 = door_x2 - MARGIN
+                    inner_y2 = door_y2 - MARGIN
+                    mask = Image.new("L", original_stock.size, 0)
+                    from PIL import ImageDraw
+                    ImageDraw.Draw(mask).rectangle(
+                        [inner_x1, inner_y1, inner_x2, inner_y2], fill=255
+                    )
+                    mask = mask.filter(ImageFilter.GaussianBlur(radius=FEATHER))
+
+                    final = original_stock.copy()
+                    final.paste(gemini_img, (0, 0), mask)
+                    final.save(out_path)
+
+                    print(f"    Saved (clamped to door bounds): {out_path}")
                     saved = True
                     break
                 if part.text:
